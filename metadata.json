@@ -1,0 +1,5 @@
+{
+  "name": "PDF Extractor",
+  "description": "A lightweight, offline client-side tool to view PDFs and extract specific pages.",
+  "requestFramePermissions": []
+}
