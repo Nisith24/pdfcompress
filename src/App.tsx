@@ -3,7 +3,7 @@ import * as pdfjsLib from 'pdfjs-dist';
 import pdfWorker from 'pdfjs-dist/build/pdf.worker.mjs?url';
 import { PDFDocument } from 'pdf-lib';
 import { motion, AnimatePresence } from 'motion/react';
-import { UploadCloud, FileText, Download, X, ChevronLeft, ChevronRight, Layers, Check, Maximize, ArrowRight, Settings2, AlertTriangle, Pencil } from 'lucide-react';
+import { UploadCloud, FileText, Download, X, ChevronLeft, ChevronRight, Layers, Check, Maximize, ArrowRight, Settings2, AlertTriangle, Pencil, Sliders } from 'lucide-react';
 import ExtractionWorker from './extractionWorker?worker';
 import CompressionWorker from './compressionWorker?worker';
 import { initDB, savePage, getPage, clearPages } from './lib/idb';
@@ -186,13 +186,19 @@ export default function App() {
   
   // Compression States
   const [compressionMode, setCompressionMode] = useState<'lossless' | 'lossy'>('lossy');
-  const [compressionPreset, setCompressionPreset] = useState<'high' | 'balanced' | 'aggressive'>('balanced');
+  const [compressionPreset, setCompressionPreset] = useState<'high' | 'balanced' | 'aggressive' | 'custom'>('balanced');
   const [isGrayscale, setIsGrayscale] = useState(false);
   const [isCompressing, setIsCompressing] = useState(false);
   const [compressionProgress, setCompressionProgress] = useState(0);
   const [timeRemaining, setTimeRemaining] = useState<number | null>(null);
   const [compressedPdfBytes, setCompressedPdfBytes] = useState<Uint8Array | null>(null);
   const [showSizeWarning, setShowSizeWarning] = useState(false);
+  
+  // Advanced Settings State
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [customResolution, setCustomResolution] = useState(1.5);
+  const [customQuality, setCustomQuality] = useState(0.6);
+  const [workerCount, setWorkerCount] = useState(Math.min(3, navigator.hardwareConcurrency || 3));
   
   const [isEditingName, setIsEditingName] = useState(false);
   const [editedName, setEditedName] = useState('');
@@ -309,9 +315,10 @@ export default function App() {
     setSelectedPages(parsePageRange(val, numPages));
   };
 
-  const handleExtract = () => {
+  const handleExtract = (goToCompress = false) => {
     if (!file || selectedPages.size === 0) return;
-    setIsExtracting(true);
+    setIsExtracting(goToCompress ? false : true); // Don't show extraction loader if we're switching views, or maybe we should?
+    if (goToCompress) setIsCompressing(true); // Show compression loader instead
     setError('');
 
     const worker = new ExtractionWorker();
@@ -321,19 +328,29 @@ export default function App() {
       const { success, pdfBytes, error } = e.data;
       
       if (success) {
-        const blob = new Blob([pdfBytes], { type: 'application/pdf' });
-        const url = URL.createObjectURL(blob);
+        const newFileName = `${file.name.replace('.pdf', '')}_extracted.pdf`;
+        const newFile = new File([pdfBytes], newFileName, { type: 'application/pdf' });
         
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = `${file.name.replace('.pdf', '')}_extracted.pdf`;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        URL.revokeObjectURL(url);
+        if (goToCompress) {
+          processFile(newFile);
+          setCurrentView('compress');
+          setIsCompressing(false);
+        } else {
+          const blob = new Blob([pdfBytes], { type: 'application/pdf' });
+          const url = URL.createObjectURL(blob);
+          
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = newFileName;
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          URL.revokeObjectURL(url);
+        }
       } else {
         console.error(error);
         setError('Failed to extract pages. The document might be protected.');
+        if (goToCompress) setIsCompressing(false);
       }
       worker.terminate();
     };
@@ -356,6 +373,7 @@ export default function App() {
       case 'high': return file.size * 0.7;
       case 'balanced': return file.size * 0.5;
       case 'aggressive': return file.size * 0.25;
+      case 'custom': return file.size * (customQuality * 0.8);
       default: return file.size * 0.5;
     }
   };
@@ -391,11 +409,12 @@ export default function App() {
         case 'high': resolution = 2.0; quality = 0.8; break;
         case 'balanced': resolution = 1.5; quality = 0.6; break;
         case 'aggressive': resolution = 1.0; quality = 0.3; break;
+        case 'custom': resolution = customResolution; quality = customQuality; break;
       }
 
       const numPages = pdfDoc.numPages;
-      // Use up to 3 workers for parallel processing, bounded by hardware
-      const maxWorkers = Math.min(3, navigator.hardwareConcurrency || 3);
+      // Use up to workerCount workers for parallel processing
+      const maxWorkers = workerCount;
       const MAX_PAGES_PER_WORKER = 15; // Cycle workers to prevent memory leaks
       const workers: { worker: Worker, activePage: number | null, timeout: any, pagesProcessed: number }[] = [];
       const pageQueue = Array.from({ length: numPages }, (_, i) => i + 1);
@@ -869,9 +888,16 @@ export default function App() {
                         Manage Pages
                       </button>
                       <button
-                        onClick={() => setCurrentView('compress')}
-                        className="w-full bg-transparent hover:bg-zinc-900 text-zinc-400 hover:text-zinc-300 text-sm py-3 rounded-xl transition-all duration-300 flex items-center justify-center border border-transparent hover:border-zinc-800"
+                        onClick={() => {
+                          if (selectedPages.size > 0 && selectedPages.size < numPages) {
+                            handleExtract(true);
+                          } else {
+                            setCurrentView('compress');
+                          }
+                        }}
+                        className="w-full bg-zinc-900/50 hover:bg-zinc-800 text-zinc-300 hover:text-zinc-100 text-sm py-3 rounded-xl transition-all duration-300 flex items-center justify-center border border-zinc-800 shadow-sm group"
                       >
+                        <ArrowRight className="w-4 h-4 mr-2 text-zinc-500 group-hover:text-zinc-300 transition-colors" />
                         Go to Compress
                       </button>
                       {error && <p className="text-xs text-red-400 mt-2 font-medium">{error}</p>}
@@ -938,6 +964,87 @@ export default function App() {
                               <div className={`absolute top-1 left-1 w-3 h-3 rounded-full bg-zinc-900 transition-transform ${isGrayscale ? 'translate-x-5' : ''}`} />
                             </div>
                           </label>
+
+                          {/* Advanced Settings Toggle */}
+                          <div className="pt-2 border-t border-zinc-800/40">
+                            <button
+                              onClick={() => setShowAdvanced(!showAdvanced)}
+                              className="flex items-center gap-2 text-xs font-medium text-zinc-500 hover:text-zinc-300 transition-colors"
+                            >
+                              <Sliders className="w-3.5 h-3.5" />
+                              Advanced Settings
+                            </button>
+                            
+                            <AnimatePresence>
+                              {showAdvanced && (
+                                <motion.div
+                                  initial={{ height: 0, opacity: 0 }}
+                                  animate={{ height: 'auto', opacity: 1 }}
+                                  exit={{ height: 0, opacity: 0 }}
+                                  className="overflow-hidden"
+                                >
+                                  <div className="mt-4 p-4 bg-zinc-950/50 border border-zinc-800/60 rounded-xl space-y-5">
+                                    <div className="space-y-2">
+                                      <div className="flex justify-between items-center">
+                                        <label className="text-xs font-medium text-zinc-400">Resolution Multiplier</label>
+                                        <span className="text-xs font-mono text-blue-400">{customResolution.toFixed(1)}x</span>
+                                      </div>
+                                      <input
+                                        type="range"
+                                        min="0.5"
+                                        max="3.0"
+                                        step="0.1"
+                                        value={customResolution}
+                                        onChange={(e) => {
+                                          setCustomResolution(parseFloat(e.target.value));
+                                          setCompressionPreset('custom');
+                                        }}
+                                        className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                                      />
+                                    </div>
+                                    
+                                    <div className="space-y-2">
+                                      <div className="flex justify-between items-center">
+                                        <label className="text-xs font-medium text-zinc-400">JPEG Quality</label>
+                                        <span className="text-xs font-mono text-blue-400">{Math.round(customQuality * 100)}%</span>
+                                      </div>
+                                      <input
+                                        type="range"
+                                        min="0.1"
+                                        max="1.0"
+                                        step="0.05"
+                                        value={customQuality}
+                                        onChange={(e) => {
+                                          setCustomQuality(parseFloat(e.target.value));
+                                          setCompressionPreset('custom');
+                                        }}
+                                        className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                                      />
+                                    </div>
+                                    
+                                    <div className="space-y-2">
+                                      <div className="flex justify-between items-center">
+                                        <label className="text-xs font-medium text-zinc-400">Worker Threads</label>
+                                        <span className="text-xs font-mono text-blue-400">{workerCount}</span>
+                                      </div>
+                                      <input
+                                        type="range"
+                                        min="1"
+                                        max={navigator.hardwareConcurrency || 4}
+                                        step="1"
+                                        value={workerCount}
+                                        onChange={(e) => setWorkerCount(parseInt(e.target.value))}
+                                        className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                                      />
+                                      <p className="text-[10px] text-zinc-500 leading-tight pt-1">
+                                        Higher values compress faster but use more RAM. Max recommended: {Math.min(3, navigator.hardwareConcurrency || 3)}.
+                                      </p>
+                                    </div>
+                                  </div>
+                                </motion.div>
+                              )}
+                            </AnimatePresence>
+                          </div>
                         </motion.div>
                       )}
 
@@ -995,6 +1102,13 @@ export default function App() {
                                   <span>Compress PDF</span>
                                 </span>
                               )}
+                            </button>
+                            <button
+                              onClick={() => setCurrentView('cut')}
+                              className="w-full bg-transparent hover:bg-zinc-900 text-zinc-500 hover:text-zinc-300 text-xs py-2 rounded-xl transition-all duration-300 flex items-center justify-center border border-transparent hover:border-zinc-800"
+                            >
+                              <ChevronLeft className="w-3 h-3 mr-1" />
+                              Back to Extraction
                             </button>
                           </div>
                         ) : (
