@@ -84,22 +84,16 @@ self.onmessage = async (e: MessageEvent) => {
       await page.render({ 
         canvasContext: ctx as any, 
         viewport,
+        canvas: canvas, // Add missing required property
         intent: 'print' 
-      }).promise;
+      } as any).promise;
       
-      // Mixed Rasterization Strategy
-      // Detect if the page contains images to decide between JPEG (lossy) and PNG (lossless)
-      const opList = await page.getOperatorList();
-      const hasImages = opList.fnArray.some(fn => 
-        fn === pdfjsLib.OPS.paintImageXObject || 
-        fn === pdfjsLib.OPS.paintImageXObjectRepeat || 
-        fn === pdfjsLib.OPS.paintJpegXObject ||
-        fn === pdfjsLib.OPS.paintInlineImageXObject
-      );
-
-      const mimeType = hasImages ? 'image/jpeg' : 'image/png';
+      // FIX: Always use JPEG for compression. 
+      // Using PNG (lossless) for rasterized pages causes the file size to explode (double or more),
+      // defeating the purpose of the compression engine.
+      const mimeType = 'image/jpeg';
       const blobOptions: any = { type: mimeType };
-      if (hasImages && quality !== undefined) {
+      if (quality !== undefined) {
         blobOptions.quality = quality;
       }
       const blob = await canvas.convertToBlob(blobOptions);

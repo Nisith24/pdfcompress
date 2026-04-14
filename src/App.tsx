@@ -3,7 +3,7 @@ import * as pdfjsLib from 'pdfjs-dist';
 import pdfWorker from 'pdfjs-dist/build/pdf.worker.mjs?url';
 import { PDFDocument } from 'pdf-lib';
 import { motion, AnimatePresence } from 'motion/react';
-import { UploadCloud, FileText, Download, X, ChevronLeft, ChevronRight, Layers, Check, Maximize, ArrowRight, Settings2, AlertTriangle, Pencil, Sliders } from 'lucide-react';
+import { UploadCloud, FileText, Download, X, ChevronLeft, ChevronRight, Layers, Check, Maximize, ArrowRight, Settings2, AlertTriangle, Pencil, Sliders, Plus, Minus, AlertCircle, CheckCircle, Info } from 'lucide-react';
 import ExtractionWorker from './extractionWorker?worker';
 import CompressionWorker from './compressionWorker?worker';
 import { initDB, savePage, getPage, clearPages } from './lib/idb';
@@ -16,7 +16,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
 class TaskQueue {
   private queue: (() => Promise<void>)[] = [];
   private active = 0;
-  private max = 2; // Limit to 2 concurrent renders for smooth scrolling
+  private max = 4; // Increased concurrency for faster thumbnail rendering
 
   enqueue(task: () => Promise<void>) {
     this.queue.push(task);
@@ -92,7 +92,7 @@ const Thumbnail = memo(({
   onClick: (p: number) => void;
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [isVisible, setIsVisible] = useState(false);
+  const [isVisible, setIsVisible] = useState(pageNum <= 12); // Pre-render first 12 pages for better UX
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -124,7 +124,11 @@ const Thumbnail = memo(({
         const ctx = canvas.getContext('2d');
         if (!ctx) return;
 
-        renderTask = page.render({ canvasContext: ctx, viewport });
+        renderTask = page.render({ 
+          canvasContext: ctx, 
+          viewport,
+          canvas: canvas // Add missing required property
+        } as any);
         await renderTask.promise;
       } catch (err: any) {
         if (err.name !== 'RenderingCancelledException' && isMounted) {
@@ -174,6 +178,7 @@ export default function App() {
   const [numPages, setNumPages] = useState<number>(0);
   
   const [previewPage, setPreviewPage] = useState<number>(1);
+  const [zoom, setZoom] = useState<number>(1.0);
   const [selectedPages, setSelectedPages] = useState<Set<number>>(new Set());
   const [rangeInput, setRangeInput] = useState<string>('');
   const [showThumbnails, setShowThumbnails] = useState(false);
@@ -203,6 +208,17 @@ export default function App() {
   const [isEditingName, setIsEditingName] = useState(false);
   const [editedName, setEditedName] = useState('');
   
+  // Toast Notification State
+  const [toast, setToast] = useState<{ message: string, type: 'error' | 'success' | 'info', id: number } | null>(null);
+
+  const showToast = useCallback((message: string, type: 'error' | 'success' | 'info' = 'info') => {
+    const id = Date.now();
+    setToast({ message, type, id });
+    setTimeout(() => {
+      setToast(current => current?.id === id ? null : current);
+    }, 5000);
+  }, []);
+
   const mainCanvasRef = useRef<HTMLCanvasElement>(null);
   const renderTaskRef = useRef<pdfjsLib.RenderTask | null>(null);
 
@@ -215,7 +231,9 @@ export default function App() {
   // --- File Handling ---
   const processFile = async (selectedFile: File) => {
     if (selectedFile.type !== 'application/pdf') {
-      setError('Invalid file format. Please upload a PDF.');
+      const msg = 'Invalid file format. Please upload a PDF.';
+      setError(msg);
+      showToast(msg, 'error');
       return;
     }
     setError('');
@@ -226,6 +244,7 @@ export default function App() {
     
     if (selectedFile.size > MAX_FILE_SIZE) {
       setShowSizeWarning(true);
+      showToast('Large file detected. Processing may take longer.', 'info');
     } else {
       setShowSizeWarning(false);
     }
@@ -244,9 +263,17 @@ export default function App() {
       const doc = await loadingTask.promise;
       setPdfDoc(doc);
       setNumPages(doc.numPages);
-    } catch (err) {
+      showToast('PDF loaded successfully.', 'success');
+    } catch (err: any) {
       console.error(err);
-      setError('Failed to parse PDF document. The file may be corrupted or unsupported.');
+      let errorMessage = 'Failed to parse PDF document. The file may be corrupted or unsupported.';
+      if (err.name === 'PasswordException') {
+        errorMessage = 'This PDF is password protected. Please unlock it first.';
+      } else if (err.name === 'InvalidPDFException') {
+        errorMessage = 'The file appears to be corrupted or is not a valid PDF.';
+      }
+      setError(errorMessage);
+      showToast(errorMessage, 'error');
       setFile(null);
     }
   };
@@ -263,25 +290,66 @@ export default function App() {
 
   // --- Main Preview Rendering ---
   useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (currentView !== 'cut') return;
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      
+      if (e.key === 'ArrowLeft') setPreviewPage(p => Math.max(1, p - 1));
+      if (e.key === 'ArrowRight') setPreviewPage(p => Math.min(numPages, p + 1));
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [numPages, currentView]);
+
+  useEffect(() => {
     let isMounted = true;
     const renderPage = async () => {
       if (!pdfDoc || !mainCanvasRef.current) return;
       setIsLoading(true);
       try {
         const page = await pdfDoc.getPage(previewPage);
-        const viewport = page.getViewport({ scale: 1.5 });
+        const baseScale = 1.5 * zoom;
+        const viewport = page.getViewport({ scale: baseScale });
+
+        // Double buffering: render to offscreen canvas first to prevent white flashes
+        const offscreenCanvas = document.createElement('canvas');
+        const offscreenContext = offscreenCanvas.getContext('2d');
+        if (!offscreenContext) return;
+
+        const outputScale = window.devicePixelRatio || 1;
+        offscreenCanvas.width = Math.floor(viewport.width * outputScale);
+        offscreenCanvas.height = Math.floor(viewport.height * outputScale);
+
+        const transform = outputScale !== 1 
+          ? [outputScale, 0, 0, outputScale, 0, 0] 
+          : null;
+
+        if (renderTaskRef.current) {
+          try { await renderTaskRef.current.cancel(); } catch (e) {}
+        }
+
+        const renderTask = page.render({ 
+          canvasContext: offscreenContext, 
+          transform: transform as any,
+          viewport,
+          canvas: offscreenCanvas
+        } as any);
+        renderTaskRef.current = renderTask;
+        await renderTask.promise;
+
+        if (!isMounted) return;
+
         const canvas = mainCanvasRef.current;
         const context = canvas.getContext('2d');
         if (!context) return;
 
-        canvas.height = viewport.height;
-        canvas.width = viewport.width;
+        // Apply dimensions and draw instantly
+        canvas.width = offscreenCanvas.width;
+        canvas.height = offscreenCanvas.height;
+        canvas.style.width = Math.floor(viewport.width) + "px";
+        canvas.style.height = Math.floor(viewport.height) + "px";
+        context.drawImage(offscreenCanvas, 0, 0);
 
-        if (renderTaskRef.current) await renderTaskRef.current.cancel();
-
-        const renderTask = page.render({ canvasContext: context, viewport });
-        renderTaskRef.current = renderTask;
-        await renderTask.promise;
       } catch (err: any) {
         if (err.name !== 'RenderingCancelledException' && isMounted) {
           console.error('Main render error:', err);
@@ -293,14 +361,16 @@ export default function App() {
     renderPage();
     return () => {
       isMounted = false;
-      if (renderTaskRef.current) renderTaskRef.current.cancel();
+      if (renderTaskRef.current) {
+        try { renderTaskRef.current.cancel(); } catch (e) {}
+      }
     };
-  }, [pdfDoc, previewPage]);
+  }, [pdfDoc, previewPage, zoom]);
 
   // --- Interactions ---
   const handleThumbnailClick = useCallback((pageNum: number) => {
     setSelectedPages(prev => {
-      const next = new Set(prev);
+      const next = new Set<number>(prev);
       if (next.has(pageNum)) next.delete(pageNum);
       else next.add(pageNum);
       setRangeInput(setToRangeString(next));
@@ -315,10 +385,36 @@ export default function App() {
     setSelectedPages(parsePageRange(val, numPages));
   };
 
-  const handleExtract = (goToCompress = false) => {
+  const handleExtract = (arg: any = false) => {
     if (!file || selectedPages.size === 0) return;
-    setIsExtracting(goToCompress ? false : true); // Don't show extraction loader if we're switching views, or maybe we should?
-    if (goToCompress) setIsCompressing(true); // Show compression loader instead
+    
+    // Robustly determine if we should go to compress view
+    // (Prevents React MouseEvents from being treated as 'true')
+    const goToCompress = arg === true;
+
+    const baseName = editedName || file.name.replace('.pdf', '');
+    const isFullFile = selectedPages.size === numPages;
+
+    // SMART: If selecting all pages, skip the worker processing for efficiency
+    if (isFullFile) {
+      if (goToCompress) {
+        setCurrentView('compress');
+      } else {
+        const filename = `${baseName}.pdf`;
+        const url = URL.createObjectURL(file);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+      }
+      return;
+    }
+
+    setIsExtracting(!goToCompress);
+    if (goToCompress) setIsCompressing(true);
     setError('');
 
     const worker = new ExtractionWorker();
@@ -328,7 +424,7 @@ export default function App() {
       const { success, pdfBytes, error } = e.data;
       
       if (success) {
-        const newFileName = `${file.name.replace('.pdf', '')}_extracted.pdf`;
+        const newFileName = `${baseName}_extracted.pdf`;
         const newFile = new File([pdfBytes], newFileName, { type: 'application/pdf' });
         
         if (goToCompress) {
@@ -336,20 +432,27 @@ export default function App() {
           setCurrentView('compress');
           setIsCompressing(false);
         } else {
-          const blob = new Blob([pdfBytes], { type: 'application/pdf' });
-          const url = URL.createObjectURL(blob);
-          
-          const link = document.createElement('a');
-          link.href = url;
-          link.download = newFileName;
-          document.body.appendChild(link);
-          link.click();
-          document.body.removeChild(link);
-          URL.revokeObjectURL(url);
+          try {
+            const blob = new Blob([pdfBytes], { type: 'application/pdf' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = newFileName;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+            showToast('PDF extracted and downloaded successfully.', 'success');
+          } catch (err) {
+            console.error('Download error:', err);
+            showToast('Failed to download the extracted PDF.', 'error');
+          }
         }
       } else {
         console.error(error);
-        setError('Failed to extract pages. The document might be protected.');
+        const msg = 'Failed to extract pages. The document might be protected or corrupted.';
+        setError(msg);
+        showToast(msg, 'error');
         if (goToCompress) setIsCompressing(false);
       }
       worker.terminate();
@@ -358,23 +461,27 @@ export default function App() {
     worker.onerror = (err) => {
       setIsExtracting(false);
       console.error(err);
-      setError('A critical error occurred during extraction.');
+      const msg = 'A critical error occurred during extraction. Please try again.';
+      setError(msg);
+      showToast(msg, 'error');
+      if (goToCompress) setIsCompressing(false);
       worker.terminate();
     };
 
-    const pagesToExtract = Array.from(selectedPages).sort((a, b) => a - b);
+    const pagesToExtract = Array.from(selectedPages).sort((a: number, b: number) => a - b);
     worker.postMessage({ file, pages: pagesToExtract });
   };
 
   const getExpectedSize = () => {
     if (!file) return 0;
-    if (compressionMode === 'lossless') return file.size * 0.9;
+    const size = file.size;
+    if (compressionMode === 'lossless') return size * 0.9;
     switch (compressionPreset) {
-      case 'high': return file.size * 0.7;
-      case 'balanced': return file.size * 0.5;
-      case 'aggressive': return file.size * 0.25;
-      case 'custom': return file.size * (customQuality * 0.8);
-      default: return file.size * 0.5;
+      case 'high': return size * 0.7;
+      case 'balanced': return size * 0.5;
+      case 'aggressive': return size * 0.25;
+      case 'custom': return size * (customQuality * 0.8);
+      default: return size * 0.5;
     }
   };
 
@@ -588,13 +695,19 @@ export default function App() {
       
       const newBytes = await newPdf.save({ useObjectStreams: true });
       setCompressedPdfBytes(newBytes);
+      showToast('PDF compressed successfully.', 'success');
       
       // Cleanup
       await clearPages(db);
 
     } catch (err: any) {
       console.error(err);
-      setError('Failed to compress PDF. ' + (err.message || 'Unknown error'));
+      let errorMessage = 'Failed to compress PDF. ' + (err.message || 'Unknown error');
+      if (err.message?.includes('memory') || err.message?.includes('allocation')) {
+        errorMessage = 'Out of memory. Try using fewer workers or a smaller file.';
+      }
+      setError(errorMessage);
+      showToast(errorMessage, 'error');
     } finally {
       setIsCompressing(false);
     }
@@ -625,6 +738,27 @@ export default function App() {
 
   return (
     <div className="min-h-screen flex flex-col font-sans selection:bg-zinc-800 selection:text-zinc-100 bg-zinc-950 bg-[radial-gradient(ellipse_80%_80%_at_50%_-20%,rgba(120,119,198,0.15),rgba(255,255,255,0))]">
+      {/* Toast Notification */}
+      <AnimatePresence>
+        {toast && (
+          <motion.div
+            initial={{ opacity: 0, y: -50, scale: 0.9 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -20, scale: 0.9 }}
+            className={`fixed top-6 left-1/2 -translate-x-1/2 z-50 flex items-center space-x-3 px-4 py-3 rounded-2xl shadow-2xl backdrop-blur-xl border ${
+              toast.type === 'error' ? 'bg-red-950/80 border-red-900/50 text-red-200' :
+              toast.type === 'success' ? 'bg-emerald-950/80 border-emerald-900/50 text-emerald-200' :
+              'bg-zinc-900/90 border-zinc-700/50 text-zinc-200'
+            }`}
+          >
+            {toast.type === 'error' && <AlertCircle className="w-5 h-5 text-red-400" />}
+            {toast.type === 'success' && <CheckCircle className="w-5 h-5 text-emerald-400" />}
+            {toast.type === 'info' && <Info className="w-5 h-5 text-zinc-400" />}
+            <span className="text-sm font-medium">{toast.message}</span>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       <header className="flex items-center justify-between px-6 py-4 border-b border-zinc-800 bg-zinc-950/50 backdrop-blur-md">
         <div className="flex items-center gap-4">
           <h1 className="text-xl font-bold text-zinc-100">PDF</h1>
@@ -755,41 +889,80 @@ export default function App() {
             <div className="flex-1 flex flex-col lg:flex-row overflow-hidden">
               {/* Left: Main Preview */}
               <div className="flex-1 relative bg-zinc-950 flex flex-col overflow-hidden">
-                <div className="absolute top-4 right-4 z-30 flex flex-col gap-2">
-                  <div className="flex flex-col items-center gap-1 bg-zinc-900/80 backdrop-blur-md border border-zinc-800 p-1 rounded-xl shadow-2xl">
-                    <button 
-                      onClick={() => setPreviewPage(p => Math.max(1, p - 1))}
-                      disabled={previewPage <= 1}
-                      className="p-1.5 text-zinc-400 hover:text-zinc-100 disabled:opacity-30 transition-colors"
-                    >
-                      <ChevronLeft className="w-4 h-4" />
-                    </button>
+                {/* Floating Controls */}
+                <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-30 flex flex-col items-center gap-2 w-[90%] max-w-md pointer-events-none">
+                  
+                  {/* Page Progress Bar */}
+                  <div className="w-full h-1.5 bg-zinc-900/80 rounded-full overflow-hidden border border-zinc-700/50 backdrop-blur-xl shadow-2xl pointer-events-auto">
+                    <motion.div 
+                      className="h-full bg-zinc-300"
+                      initial={{ width: 0 }}
+                      animate={{ width: `${(previewPage / numPages) * 100}%` }}
+                      transition={{ duration: 0.2, ease: "easeOut" }}
+                    />
+                  </div>
+
+                  {/* Control Bar */}
+                  <div className="flex flex-row items-center justify-between w-full bg-zinc-900/90 backdrop-blur-xl border border-zinc-800 p-1.5 sm:p-2 rounded-2xl shadow-[0_20px_50px_rgba(0,0,0,0.5)] pointer-events-auto">
                     
-                    <div className="flex flex-col items-center gap-0.5 px-1 py-1">
-                      <input
-                        type="number"
-                        min={1}
-                        max={numPages}
-                        value={previewPage}
-                        onChange={(e) => {
-                          const val = parseInt(e.target.value);
-                          if (val >= 1 && val <= numPages) setPreviewPage(val);
-                        }}
-                        className="w-10 bg-zinc-950 border border-zinc-800 text-zinc-100 text-[10px] rounded-md px-1 py-1 focus:outline-none focus:ring-1 focus:ring-zinc-600 font-mono text-center"
-                      />
-                      <span className="text-[9px] text-zinc-500 font-mono">/ {numPages}</span>
+                    {/* Pagination */}
+                    <div className="flex flex-row items-center gap-1">
+                      <button 
+                        onClick={() => setPreviewPage(p => Math.max(1, p - 1))}
+                        disabled={previewPage <= 1}
+                        className="p-1.5 sm:p-2 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 rounded-lg disabled:opacity-20 transition-all"
+                      >
+                        <ChevronLeft className="w-4 h-4 sm:w-5 sm:h-5" />
+                      </button>
+                      
+                      <div className="flex flex-row items-center px-2 py-1 bg-zinc-950/50 rounded-lg border border-zinc-800/50">
+                        <input
+                          type="number"
+                          min={1}
+                          max={numPages}
+                          value={previewPage}
+                          onChange={(e) => {
+                            const val = parseInt(e.target.value);
+                            if (val >= 1 && val <= numPages) setPreviewPage(val);
+                          }}
+                          className="w-8 sm:w-10 bg-transparent text-zinc-100 text-[10px] sm:text-xs font-mono text-center focus:outline-none"
+                        />
+                        <span className="text-[10px] sm:text-xs text-zinc-500 font-mono ml-1">/ {numPages}</span>
+                      </div>
+
+                      <button 
+                        onClick={() => setPreviewPage(p => Math.min(numPages, p + 1))}
+                        disabled={previewPage >= numPages}
+                        className="p-1.5 sm:p-2 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 rounded-lg disabled:opacity-20 transition-all"
+                      >
+                        <ChevronRight className="w-4 h-4 sm:w-5 sm:h-5" />
+                      </button>
                     </div>
 
-                    <button 
-                      onClick={() => setPreviewPage(p => Math.min(numPages, p + 1))}
-                      disabled={previewPage >= numPages}
-                      className="p-1.5 text-zinc-400 hover:text-zinc-100 disabled:opacity-30 transition-colors"
-                    >
-                      <ChevronRight className="w-4 h-4" />
-                    </button>
+                    <div className="h-6 sm:h-8 w-px bg-zinc-800"></div>
 
-                    <div className="w-4 h-px bg-zinc-800 my-1"></div>
+                    {/* Zoom */}
+                    <div className="flex flex-row items-center gap-1">
+                      <button 
+                        onClick={() => setZoom(z => Math.max(0.5, z - 0.2))}
+                        className="p-1.5 sm:p-2 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 rounded-lg transition-all"
+                        title="Zoom Out"
+                      >
+                        <Minus className="w-3 h-3 sm:w-4 sm:h-4" />
+                      </button>
+                      <span className="text-[10px] font-mono text-zinc-500 w-8 text-center hidden sm:inline-block">{Math.round(zoom * 100)}%</span>
+                      <button 
+                        onClick={() => setZoom(z => Math.min(3, z + 0.2))}
+                        className="p-1.5 sm:p-2 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 rounded-lg transition-all"
+                        title="Zoom In"
+                      >
+                        <Plus className="w-3 h-3 sm:w-4 sm:h-4" />
+                      </button>
+                    </div>
 
+                    <div className="h-6 sm:h-8 w-px bg-zinc-800"></div>
+
+                    {/* Fullscreen */}
                     <button 
                       onClick={() => {
                         const container = document.getElementById('pdf-viewer-container');
@@ -798,45 +971,53 @@ export default function App() {
                           else document.exitFullscreen();
                         }
                       }}
-                      className="p-1.5 text-zinc-400 hover:text-zinc-100 transition-colors"
+                      className="p-1.5 sm:p-2 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 rounded-lg transition-all"
+                      title="Fullscreen"
                     >
-                      <Maximize className="w-3 h-3" />
+                      <Maximize className="w-3 h-3 sm:w-4 sm:h-4" />
                     </button>
                   </div>
                 </div>
                 
-                <div className="flex-1 overflow-hidden flex items-center justify-center p-8 relative" id="pdf-viewer-container">
-
-                  {isLoading && (
-                    <div className="absolute inset-0 flex items-center justify-center bg-zinc-950/50 z-20 backdrop-blur-[2px] transition-all duration-300">
-                      <div className="flex flex-col items-center space-y-4">
-                        <div className="w-10 h-10 border-[3px] border-zinc-800 border-t-zinc-300 rounded-full animate-spin" />
-                        <span className="text-xs font-medium text-zinc-400 tracking-widest uppercase">Rendering</span>
-                      </div>
-                    </div>
-                  )}
-                  <motion.div
-                    animate={{ opacity: isLoading ? 0.4 : 1, scale: isLoading ? 0.98 : 1 }}
-                    transition={{ duration: 0.3, ease: "easeInOut" }}
-                    drag="x"
-                    dragConstraints={{ left: 0, right: 0 }}
-                    dragElastic={0.1}
-                    onDragEnd={(e, { offset, velocity }) => {
-                      const swipe = offset.x * velocity.x;
-                      if (swipe < -5000) { // Swipe left
-                        if (previewPage < numPages) setPreviewPage(p => p + 1);
-                      } else if (swipe > 5000) { // Swipe right
-                        if (previewPage > 1) setPreviewPage(p => p - 1);
-                      }
-                    }}
-                    className="cursor-grab active:cursor-grabbing flex items-center justify-center w-full h-full"
+                <div 
+                  className="flex-1 overflow-auto flex items-center justify-center p-4 relative" 
+                  id="pdf-viewer-container"
+                  style={{
+                    backgroundImage: 'radial-gradient(circle at 1px 1px, rgba(255,255,255,0.05) 1px, transparent 0)',
+                    backgroundSize: '24px 24px'
+                  }}
+                >
+                  {/* Navigation Sliders */}
+                  <button 
+                    onClick={() => setPreviewPage(p => Math.max(1, p - 1))}
+                    disabled={previewPage <= 1}
+                    className="absolute left-4 z-30 p-3 sm:p-4 bg-zinc-900/90 text-white rounded-full hover:bg-zinc-700 disabled:opacity-0 transition-all hover:scale-110 shadow-2xl border border-zinc-700/50 backdrop-blur-md"
                   >
+                    <ChevronLeft className="w-6 h-6 sm:w-8 sm:h-8" />
+                  </button>
+                  <button 
+                    onClick={() => setPreviewPage(p => Math.min(numPages, p + 1))}
+                    disabled={previewPage >= numPages}
+                    className="absolute right-4 z-30 p-3 sm:p-4 bg-zinc-900/90 text-white rounded-full hover:bg-zinc-700 disabled:opacity-0 transition-all hover:scale-110 shadow-2xl border border-zinc-700/50 backdrop-blur-md"
+                  >
+                    <ChevronRight className="w-6 h-6 sm:w-8 sm:h-8" />
+                  </button>
+
+                  <div className="relative shadow-2xl ring-1 ring-white/10 bg-white transition-transform duration-200 ease-out min-h-[50vh] min-w-[300px] flex items-center justify-center" style={{ transformOrigin: 'top center' }}>
                     <canvas 
                       ref={mainCanvasRef} 
-                      className="max-w-full h-auto bg-zinc-100 shadow-2xl ring-1 ring-white/10 transition-shadow"
-                      style={{ maxHeight: 'calc(100vh - 8rem)' }}
+                      className={`block max-w-full max-h-[75vh] object-contain transition-opacity duration-150 ${isLoading ? 'opacity-50' : 'opacity-100'}`}
                     />
-                  </motion.div>
+                    
+                    {isLoading && (
+                      <div className="absolute inset-0 flex items-center justify-center z-20 pointer-events-none">
+                        <div className="flex flex-col items-center space-y-4 bg-zinc-900/90 p-6 rounded-2xl shadow-2xl border border-zinc-800 backdrop-blur-md">
+                          <div className="w-8 h-8 border-[3px] border-zinc-700 border-t-zinc-300 rounded-full animate-spin" />
+                          <span className="text-[10px] font-mono text-zinc-400 tracking-widest uppercase">Rendering</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
 
@@ -864,7 +1045,7 @@ export default function App() {
                       </div>
                       
                       <button
-                        onClick={handleExtract}
+                        onClick={() => handleExtract(false)}
                         disabled={selectedPages.size === 0 || isExtracting}
                         className="w-full relative overflow-hidden group bg-zinc-100 hover:bg-white text-zinc-950 disabled:bg-zinc-900 disabled:text-zinc-600 disabled:border-zinc-800 disabled:border font-semibold text-sm py-3 rounded-xl transition-all duration-300 flex items-center justify-center shadow-lg hover:shadow-xl disabled:shadow-none"
                       >
@@ -876,7 +1057,7 @@ export default function App() {
                         ) : (
                           <span className="flex items-center space-x-2">
                             <Download className="w-4 h-4" />
-                            <span>Extract {selectedPages.size > 0 ? `${selectedPages.size} Pages` : ''}</span>
+                            <span>Download {selectedPages.size > 0 ? `${selectedPages.size} Pages` : ''}</span>
                           </span>
                         )}
                       </button>
