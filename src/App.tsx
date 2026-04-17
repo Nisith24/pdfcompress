@@ -3,7 +3,7 @@ import * as pdfjsLib from 'pdfjs-dist';
 import pdfWorker from 'pdfjs-dist/build/pdf.worker.mjs?url';
 import { PDFDocument } from 'pdf-lib';
 import { motion, AnimatePresence } from 'motion/react';
-import { UploadCloud, FileText, Download, X, ChevronLeft, ChevronRight, Layers, Check, Maximize, ArrowRight, Settings2, AlertTriangle, Pencil, Sliders, Plus, Minus, AlertCircle, CheckCircle, Info } from 'lucide-react';
+import { UploadCloud, FileText, Download, X, ChevronLeft, ChevronRight, Layers, Check, Maximize, ArrowRight, Settings2, AlertTriangle, Pencil, Sliders, Plus, Minus, AlertCircle, CheckCircle, Info, Search, Loader2 } from 'lucide-react';
 import ExtractionWorker from './extractionWorker?worker';
 import CompressionWorker from './compressionWorker?worker';
 import { initDB, savePage, getPage, clearPages } from './lib/idb';
@@ -187,6 +187,11 @@ export default function App() {
   const [isDragging, setIsDragging] = useState(false);
   const [isExtracting, setIsExtracting] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [isParsing, setIsParsing] = useState(false);
+  const [isCanvasMounted, setIsCanvasMounted] = useState(false);
+  const [searchText, setSearchText] = useState('');
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [searchResults, setSearchResults] = useState<number[]>([]);
   const [error, setError] = useState('');
   
   // Compression States
@@ -198,6 +203,73 @@ export default function App() {
   const [timeRemaining, setTimeRemaining] = useState<number | null>(null);
   const [compressedPdfBytes, setCompressedPdfBytes] = useState<Uint8Array | null>(null);
   const [showSizeWarning, setShowSizeWarning] = useState(false);
+  
+  useEffect(() => {
+    if (!pdfDoc || !searchText) {
+      setSearchResults([]);
+      return;
+    }
+
+    const search = async () => {
+      const results: number[] = [];
+      for (let i = 1; i <= pdfDoc.numPages; i++) {
+        const page = await pdfDoc.getPage(i);
+        const textContent = await page.getTextContent();
+        const text = textContent.items.map((item: any) => item.str).join(' ');
+        if (text.toLowerCase().includes(searchText.toLowerCase())) {
+          results.push(i);
+        }
+      }
+      setSearchResults(results);
+    };
+    search();
+  }, [pdfDoc, searchText]);
+  
+  const zoomRef = useRef(zoom);
+  const containerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => { zoomRef.current = zoom; }, [zoom]);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    let initialDistance = 0;
+    let initialZoom = 1.0;
+
+    const getDistance = (e: TouchEvent) => {
+      const touch1 = e.touches[0];
+      const touch2 = e.touches[1];
+      return Math.sqrt(
+        Math.pow(touch2.clientX - touch1.clientX, 2) +
+        Math.pow(touch2.clientY - touch1.clientY, 2)
+      );
+    };
+
+    const handleTouchStart = (e: TouchEvent) => {
+      if (e.touches.length === 2) {
+        initialDistance = getDistance(e);
+        initialZoom = zoomRef.current;
+      }
+    };
+
+    const handleTouchMove = (e: TouchEvent) => {
+      if (e.touches.length === 2) {
+        e.preventDefault();
+        const currentDistance = getDistance(e);
+        const scale = currentDistance / initialDistance;
+        const newZoom = Math.max(0.5, Math.min(3.0, initialZoom * scale));
+        setZoom(newZoom);
+      }
+    };
+
+    container.addEventListener('touchstart', handleTouchStart, { passive: false });
+    container.addEventListener('touchmove', handleTouchMove, { passive: false });
+
+    return () => {
+      container.removeEventListener('touchstart', handleTouchStart);
+      container.removeEventListener('touchmove', handleTouchMove);
+    };
+  }, [pdfDoc]);
   
   // Advanced Settings State
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -239,6 +311,7 @@ export default function App() {
     setError('');
     setFile(selectedFile);
     setPreviewPage(1);
+    setIsCanvasMounted(false);
     setSelectedPages(new Set());
     setRangeInput('');
     
@@ -248,6 +321,8 @@ export default function App() {
     } else {
       setShowSizeWarning(false);
     }
+
+    setIsParsing(true);
 
     try {
       const url = URL.createObjectURL(selectedFile);
@@ -275,6 +350,8 @@ export default function App() {
       setError(errorMessage);
       showToast(errorMessage, 'error');
       setFile(null);
+    } finally {
+      setIsParsing(false);
     }
   };
 
@@ -350,6 +427,53 @@ export default function App() {
         canvas.style.height = Math.floor(viewport.height) + "px";
         context.drawImage(offscreenCanvas, 0, 0);
 
+        // --- Text Highlighting ---
+        if (searchText && isMounted) {
+          const textContent = await page.getTextContent();
+          const items = textContent.items as any[];
+          
+          context.fillStyle = 'rgba(255, 255, 0, 0.4)'; // Yellow highlight
+          
+          items.forEach(item => {
+            const str = item.str;
+            const searchLower = searchText.toLowerCase();
+            const strLower = str.toLowerCase();
+            
+            if (strLower.includes(searchLower)) {
+              const tx = item.transform;
+              const fontSize = Math.sqrt(tx[2] * tx[2] + tx[3] * tx[3]) || tx[0];
+              
+              // Find all occurrences in this string
+              let startIndex = 0;
+              while ((startIndex = strLower.indexOf(searchLower, startIndex)) !== -1) {
+                // Calculate proportional offset and width (linear approximation)
+                const charWidth = item.width / str.length;
+                const matchOffset = startIndex * charWidth;
+                const matchWidth = searchText.length * charWidth;
+                
+                const pdfRect = [
+                  tx[4] + matchOffset, 
+                  tx[5], 
+                  tx[4] + matchOffset + matchWidth, 
+                  tx[5] + fontSize
+                ];
+                
+                const viewportRect = viewport.convertToViewportRectangle(pdfRect);
+                const [x1, y1, x2, y2] = viewportRect;
+                
+                context.fillRect(
+                  Math.min(x1, x2) * outputScale, 
+                  Math.min(y1, y2) * outputScale, 
+                  Math.abs(x2 - x1) * outputScale, 
+                  Math.abs(y2 - y1) * outputScale
+                );
+                
+                startIndex += searchText.length;
+              }
+            }
+          });
+        }
+
       } catch (err: any) {
         if (err.name !== 'RenderingCancelledException' && isMounted) {
           console.error('Main render error:', err);
@@ -365,7 +489,7 @@ export default function App() {
         try { renderTaskRef.current.cancel(); } catch (e) {}
       }
     };
-  }, [pdfDoc, previewPage, zoom]);
+  }, [pdfDoc, previewPage, zoom, searchText, isCanvasMounted]);
 
   // --- Interactions ---
   const handleThumbnailClick = useCallback((pageNum: number) => {
@@ -509,13 +633,13 @@ export default function App() {
       }
 
       // Lossy (Rasterize)
-      let resolution = 1.5;
-      let quality = 0.6;
+      let resolution = 2.0;
+      let quality = 0.75;
 
       switch (compressionPreset) {
-        case 'high': resolution = 2.0; quality = 0.8; break;
-        case 'balanced': resolution = 1.5; quality = 0.6; break;
-        case 'aggressive': resolution = 1.0; quality = 0.3; break;
+        case 'high': resolution = 3.0; quality = 0.9; break;
+        case 'balanced': resolution = 2.0; quality = 0.75; break;
+        case 'aggressive': resolution = 1.2; quality = 0.5; break;
         case 'custom': resolution = customResolution; quality = customQuality; break;
       }
 
@@ -734,6 +858,7 @@ export default function App() {
     setRangeInput('');
     setCompressedPdfBytes(null);
     setCompressionProgress(0);
+    setIsCanvasMounted(false);
   };
 
   return (
@@ -803,13 +928,31 @@ export default function App() {
                 onDrop={onDrop}
                 className={`relative flex flex-col items-center justify-center w-full h-72 rounded-3xl border-2 border-dashed transition-all duration-300 cursor-pointer overflow-hidden group
                   ${isDragging ? 'border-zinc-400 bg-zinc-900/50 scale-[1.02]' : 'border-zinc-800 hover:border-zinc-600 hover:bg-zinc-900/40'}
+                  ${isParsing ? 'pointer-events-none opacity-50' : ''}
                 `}
               >
                 <div className="absolute inset-0 bg-gradient-to-b from-transparent to-zinc-950/50 pointer-events-none" />
-                <UploadCloud className={`w-12 h-12 mb-5 transition-colors duration-300 ${isDragging ? 'text-zinc-200' : 'text-zinc-500 group-hover:text-zinc-400'}`} />
-                <p className="text-base font-medium text-zinc-200">Drop your PDF here</p>
-                <p className="text-sm text-zinc-500 mt-2">or click to browse from your computer</p>
-                <input type="file" accept="application/pdf" className="hidden" onChange={(e) => e.target.files?.[0] && processFile(e.target.files[0])} />
+                
+                {isParsing ? (
+                  <div className="flex flex-col items-center space-y-4 z-10">
+                    <div className="relative">
+                      <div className="absolute inset-0 bg-blue-500/20 blur-xl rounded-full animate-pulse" />
+                      <Loader2 className="w-10 h-10 text-blue-500 animate-spin relative z-10" />
+                    </div>
+                    <div className="text-center">
+                      <p className="text-base font-medium text-zinc-200">Loading PDF...</p>
+                      <p className="text-xs text-zinc-500 font-mono mt-1">Parsing document structure</p>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <UploadCloud className={`w-12 h-12 mb-5 transition-colors duration-300 ${isDragging ? 'text-zinc-200' : 'text-zinc-500 group-hover:text-zinc-400'}`} />
+                    <p className="text-base font-medium text-zinc-200">Drop your PDF here</p>
+                    <p className="text-sm text-zinc-500 mt-2">or click to browse from your computer</p>
+                  </>
+                )}
+                
+                <input type="file" accept="application/pdf" className="hidden" onChange={(e) => e.target.files?.[0] && processFile(e.target.files[0])} disabled={isParsing} />
               </label>
 
               {error && (
@@ -881,9 +1024,68 @@ export default function App() {
                   {numPages} pages
                 </span>
               </div>
-              <button onClick={reset} className="p-2 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900 rounded-lg transition-colors">
-                <X className="w-4 h-4" />
-              </button>
+              <div className="flex items-center gap-2">
+                {isSearchOpen && (
+                  <div className="flex items-center gap-2 bg-zinc-900 border border-zinc-800 rounded-lg px-2 py-1">
+                    <Search className="w-3.5 h-3.5 text-zinc-400" />
+                    <input 
+                      type="text" 
+                      placeholder="Search text..." 
+                      value={searchText}
+                      onChange={(e) => setSearchText(e.target.value)}
+                      className="bg-transparent text-sm text-zinc-200 focus:outline-none w-32 sm:w-48"
+                      autoFocus
+                    />
+                    {searchText && (
+                      <button 
+                        onClick={() => setSearchText('')}
+                        className="p-0.5 text-zinc-500 hover:text-zinc-300"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    )}
+                    {searchResults.length > 0 && (
+                      <div className="flex items-center gap-1 text-xs text-zinc-400 border-l border-zinc-700 pl-2 ml-1">
+                        <span>{searchResults.indexOf(previewPage) + 1} / {searchResults.length}</span>
+                        <div className="flex items-center gap-0.5 ml-1">
+                          <button 
+                            onClick={() => {
+                              const currentIndex = searchResults.indexOf(previewPage);
+                              const prevIndex = (currentIndex - 1 + searchResults.length) % searchResults.length;
+                              setPreviewPage(searchResults[prevIndex]);
+                            }} 
+                            className="hover:text-zinc-100 p-1 rounded hover:bg-zinc-800"
+                            title="Previous match"
+                          >
+                            <ChevronLeft className="w-3 h-3" />
+                          </button>
+                          <button 
+                            onClick={() => {
+                              const currentIndex = searchResults.indexOf(previewPage);
+                              const nextIndex = (currentIndex + 1) % searchResults.length;
+                              setPreviewPage(searchResults[nextIndex]);
+                            }} 
+                            className="hover:text-zinc-100 p-1 rounded hover:bg-zinc-800"
+                            title="Next match"
+                          >
+                            <ChevronRight className="w-3 h-3" />
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+                <button 
+                  onClick={() => setIsSearchOpen(!isSearchOpen)} 
+                  className={`p-2 rounded-lg transition-colors ${isSearchOpen ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900'}`}
+                  title="Search PDF"
+                >
+                  <Search className="w-4 h-4" />
+                </button>
+                <button onClick={reset} className="p-2 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900 rounded-lg transition-colors">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
             </header>
 
             <div className="flex-1 flex flex-col lg:flex-row overflow-hidden">
@@ -981,6 +1183,7 @@ export default function App() {
                 
                 <div 
                   className="flex-1 overflow-auto flex items-center justify-center p-4 relative" 
+                  ref={containerRef}
                   id="pdf-viewer-container"
                   style={{
                     backgroundImage: 'radial-gradient(circle at 1px 1px, rgba(255,255,255,0.05) 1px, transparent 0)',
@@ -1005,18 +1208,14 @@ export default function App() {
 
                   <div className="relative shadow-2xl ring-1 ring-white/10 bg-white transition-transform duration-200 ease-out min-h-[50vh] min-w-[300px] flex items-center justify-center" style={{ transformOrigin: 'top center' }}>
                     <canvas 
-                      ref={mainCanvasRef} 
+                      ref={(el) => {
+                        mainCanvasRef.current = el;
+                        if (el && !isCanvasMounted) setIsCanvasMounted(true);
+                      }} 
                       className={`block max-w-full max-h-[75vh] object-contain transition-opacity duration-150 ${isLoading ? 'opacity-50' : 'opacity-100'}`}
                     />
                     
-                    {isLoading && (
-                      <div className="absolute inset-0 flex items-center justify-center z-20 pointer-events-none">
-                        <div className="flex flex-col items-center space-y-4 bg-zinc-900/90 p-6 rounded-2xl shadow-2xl border border-zinc-800 backdrop-blur-md">
-                          <div className="w-8 h-8 border-[3px] border-zinc-700 border-t-zinc-300 rounded-full animate-spin" />
-                          <span className="text-[10px] font-mono text-zinc-400 tracking-widest uppercase">Rendering</span>
-                        </div>
-                      </div>
-                    )}
+                    
                   </div>
                 </div>
               </div>
@@ -1051,7 +1250,7 @@ export default function App() {
                       >
                         {isExtracting ? (
                           <span className="flex items-center space-x-3">
-                            <div className="w-4 h-4 border-2 border-zinc-950/30 border-t-zinc-950 rounded-full animate-spin" />
+                            <Loader2 className="w-4 h-4 animate-spin" />
                             <span>Processing...</span>
                           </span>
                         ) : (
@@ -1109,6 +1308,11 @@ export default function App() {
                             Basic (Lossless)
                           </button>
                         </div>
+                        {compressionMode === 'lossy' && (
+                          <p className="text-[10px] text-zinc-500 leading-tight">
+                            <span className="text-amber-500/80 font-semibold">Note:</span> Smart mode flattens the PDF into images. This drastically reduces file size but removes text searchability.
+                          </p>
+                        )}
                       </div>
 
                       {compressionMode === 'lossy' && (
@@ -1118,7 +1322,7 @@ export default function App() {
                             <label className="text-xs font-semibold text-zinc-400 uppercase tracking-wider">Smart Presets</label>
                             <div className="grid grid-cols-3 gap-2">
                               {[
-                                { id: 'high', label: 'High Quality', desc: 'Best for medical/images' },
+                                { id: 'high', label: 'High Quality', desc: 'Crisp text & images' },
                                 { id: 'balanced', label: 'Balanced', desc: 'Good size & quality' },
                                 { id: 'aggressive', label: 'Aggressive', desc: 'Smallest file size' }
                               ].map((preset) => (
@@ -1268,7 +1472,7 @@ export default function App() {
                               {isCompressing ? (
                                 <span className="flex flex-col items-center justify-center relative z-10 w-full">
                                   <span className="flex items-center space-x-3 mb-1">
-                                    <div className="w-4 h-4 border-2 border-zinc-500 border-t-zinc-300 rounded-full animate-spin" />
+                                    <Loader2 className="w-4 h-4 animate-spin text-zinc-300" />
                                     <span className="text-zinc-300">Compressing... {compressionProgress}%</span>
                                   </span>
                                   {timeRemaining !== null && (
