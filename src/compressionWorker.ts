@@ -30,9 +30,8 @@ if (typeof document === 'undefined') {
 }
 
 import * as pdfjsLib from 'pdfjs-dist';
-import pdfWorker from 'pdfjs-dist/build/pdf.worker.mjs?url';
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
+pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@5.6.205/build/pdf.worker.min.mjs`;
 
 let doc: pdfjsLib.PDFDocumentProxy | null = null;
 let fileUrl: string | null = null;
@@ -84,13 +83,33 @@ self.onmessage = async (e: MessageEvent) => {
       await page.render({ 
         canvasContext: ctx as any, 
         viewport,
-        canvas: canvas, // Add missing required property
+        canvas: canvas,
         intent: 'print' 
       } as any).promise;
+
+      // --- TEXT EXTRACTION ---
+      // Extract text content and convert transforms to match the viewport (raster resolution)
+      const textContent = await page.getTextContent();
+      const textItems = textContent.items.map((item: any) => {
+        // item.transform is [scaleX, skewY, skewX, scaleY, translateX, translateY] in PDF points
+        // We scale it by the current resolution to match the rasterized coordinates
+        const tx = [...item.transform];
+        tx[4] *= resolution; // x
+        tx[5] *= resolution; // y
+        // We also need to scale the font size components
+        tx[0] *= resolution;
+        tx[3] *= resolution;
+        
+        return {
+          str: item.str,
+          dir: item.dir,
+          width: item.width * resolution,
+          height: item.height * resolution,
+          transform: tx,
+          fontName: item.fontName
+        };
+      });
       
-      // FIX: Always use JPEG for compression. 
-      // Using PNG (lossless) for rasterized pages causes the file size to explode (double or more),
-      // defeating the purpose of the compression engine.
       const mimeType = 'image/jpeg';
       const blobOptions: any = { type: mimeType };
       if (quality !== undefined) {
@@ -107,14 +126,15 @@ self.onmessage = async (e: MessageEvent) => {
       }
       
       // Transfer ownership of the ArrayBuffer back to the main thread
-      self.postMessage({ 
+      (self as any).postMessage({ 
         type: 'RENDER_DONE', 
         pageNumber, 
         buffer, 
         width: viewport.width, 
         height: viewport.height,
-        mimeType
-      }, [buffer]);
+        mimeType,
+        textItems
+      }, { transfer: [buffer] });
     }
   } catch (error: any) {
     self.postMessage({ type: 'ERROR', error: error.message || 'Unknown error', pageNumber });

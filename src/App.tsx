@@ -1,7 +1,6 @@
 import React, { useState, useRef, useEffect, memo, useCallback } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
-import pdfWorker from 'pdfjs-dist/build/pdf.worker.mjs?url';
-import { PDFDocument } from 'pdf-lib';
+import { PDFDocument, StandardFonts } from 'pdf-lib';
 import { motion, AnimatePresence } from 'motion/react';
 import { UploadCloud, FileText, Download, X, ChevronLeft, ChevronRight, Layers, Check, Maximize, ArrowRight, Settings2, AlertTriangle, Pencil, Sliders, Plus, Minus, AlertCircle, CheckCircle, Info, Search, Loader2 } from 'lucide-react';
 import ExtractionWorker from './extractionWorker?worker';
@@ -10,7 +9,7 @@ import { initDB, savePage, getPage, clearPages } from './lib/idb';
 
 const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
+pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@5.6.205/build/pdf.worker.min.mjs`;
 
 // --- Task Queue for Concurrency Limiting ---
 class TaskQueue {
@@ -654,7 +653,7 @@ export default function App() {
       // IndexedDB Setup
       const db = await initDB();
       await clearPages(db);
-      const renderedPagesMeta: { pageNumber: number, key: string, width: number, height: number, mimeType: string }[] = [];
+      const renderedPagesMeta: { pageNumber: number, key: string, width: number, height: number, mimeType: string, textItems?: any[] }[] = [];
       
       let pagesProcessed = 0;
       let pagesFailed = 0;
@@ -740,13 +739,14 @@ export default function App() {
                 assignWork(workerObj);
               }
             } else if (type === 'RENDER_DONE') {
+              const { textItems } = e.data;
               clearTimeout(workerObj.timeout);
               workerObj.activePage = null;
               
               // Save to IndexedDB instead of RAM
               const key = `page_${pageNumber}`;
               await savePage(db, key, buffer);
-              renderedPagesMeta.push({ pageNumber, key, width, height, mimeType });
+              renderedPagesMeta.push({ pageNumber, key, width, height, mimeType, textItems });
               
               pagesProcessed++;
               setCompressionProgress(Math.round((pagesProcessed / numPages) * 100));
@@ -796,6 +796,7 @@ export default function App() {
       }
 
       const newPdf = await PDFDocument.create();
+      const font = await newPdf.embedFont(StandardFonts.Helvetica);
       renderedPagesMeta.sort((a, b) => a.pageNumber - b.pageNumber);
 
       for (const rp of renderedPagesMeta) {
@@ -815,6 +816,28 @@ export default function App() {
           width: rp.width,
           height: rp.height,
         });
+
+        // --- DRAW INVISIBLE TEXT LAYER ---
+        if (rp.textItems) {
+          for (const item of rp.textItems) {
+            // item.transform is [scaleX, skewY, skewX, scaleY, x, y]
+            // pdf-lib's drawText uses bottom-left origin, which matches PDF coordinates
+            const tx = item.transform;
+            const fontSize = Math.sqrt(tx[0] * tx[0] + tx[1] * tx[1]);
+            
+            try {
+              newPage.drawText(item.str, {
+                x: tx[4],
+                y: tx[5],
+                size: fontSize > 0 ? fontSize : 10,
+                font: font,
+                opacity: 0, // Make text invisible but searchable
+              });
+            } catch (e) {
+              // Silently skip characters font can't handle to prevent crash
+            }
+          }
+        }
       }
       
       const newBytes = await newPdf.save({ useObjectStreams: true });
@@ -901,6 +924,11 @@ export default function App() {
               Compress
             </button>
           </nav>
+        </div>
+        <div className="flex items-center">
+          <button className="bg-emerald-400 text-zinc-950 text-[10px] font-bold px-2 py-1 rounded uppercase tracking-wider hover:bg-emerald-300 transition-colors">
+            Action
+          </button>
         </div>
       </header>
       <AnimatePresence mode="wait">
@@ -1081,6 +1109,9 @@ export default function App() {
                   title="Search PDF"
                 >
                   <Search className="w-4 h-4" />
+                </button>
+                <button className="bg-emerald-400 text-zinc-950 text-[10px] font-bold px-2 py-1 rounded uppercase tracking-wider hover:bg-emerald-300 transition-colors">
+                  Action
                 </button>
                 <button onClick={reset} className="p-2 text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900 rounded-lg transition-colors">
                   <X className="w-4 h-4" />

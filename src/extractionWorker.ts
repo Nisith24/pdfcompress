@@ -30,7 +30,7 @@ self.onmessage = async (e: MessageEvent) => {
     
     const newPdfBytes = await newPdf.save();
     
-    self.postMessage({ success: true, pdfBytes: newPdfBytes }, [newPdfBytes.buffer]);
+    (self as any).postMessage({ success: true, pdfBytes: newPdfBytes }, { transfer: [newPdfBytes.buffer] });
   } catch (error: any) {
     self.postMessage({ success: false, error: error.message });
   }
